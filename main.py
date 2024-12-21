@@ -1,12 +1,11 @@
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from sklearn.preprocessing import MinMaxScaler
-from statsmodels.tsa.arima.model import ARIMA
-from sklearn.metrics import mean_squared_error
+from statsmodels.tsa.statespace.sarimax import SARIMAX
 from keras.models import Sequential
 from keras.layers import LSTM, Dense
-from keras.preprocessing.sequence import TimeseriesGenerator
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error
 import requests
 from matplotlib.animation import FuncAnimation
 import sqlite3
@@ -20,16 +19,14 @@ from dotenv import load_dotenv
 load_dotenv()
 # Генерация симулированных данных
 def generate_data():
-    np.random.seed(42)
-    date_rng = pd.date_range(start='2023-01-01', end='2023-01-31', freq='T')
+    timestamps = pd.date_range(start='2023-01-01', periods=1000, freq='T')
     data = {
-        'timestamp': date_rng,
-        'CPU_usage': np.random.normal(loc=50, scale=10, size=(len(date_rng))),
-        'RAM_usage': np.random.normal(loc=60, scale=15, size=(len(date_rng))),
-        'network_traffic': np.random.normal(loc=70, scale=20, size=(len(date_rng)))
+        'timestamp': timestamps,
+        'CPU_usage': np.random.rand(1000) * 100,
+        'RAM_usage': np.random.rand(1000) * 100,
+        'network_traffic': np.random.rand(1000) * 100
     }
-    df = pd.DataFrame(data)
-    return df
+    return pd.DataFrame(data)
 
 # Предобработка данных
 def preprocess_data(df):
@@ -37,8 +34,50 @@ def preprocess_data(df):
     df = df.resample('T').mean()  # Приведение к минутному интервалу
     df.fillna(method='ffill', inplace=True)  # Удаление пропусков
     scaler = MinMaxScaler()
-    df_scaled = pd.DataFrame(scaler.fit_transform(df), columns=df.columns, index=df.index)
-    return df_scaled
+    df[['CPU_usage', 'RAM_usage', 'network_traffic']] = scaler.fit_transform(df[['CPU_usage', 'RAM_usage', 'network_traffic']])
+    return df, scaler
+
+# SARIMA прогноз
+def sarima_forecast(df, steps=10):
+    model = SARIMAX(df['CPU_usage'], order=(1, 1, 1), seasonal_order=(1, 1, 1, 12))
+    model_fit = model.fit(disp=False)
+    forecast = model_fit.forecast(steps=steps)
+    return forecast
+
+# Подготовка данных для LSTM
+def create_lstm_data(df, time_step=10):
+    data = df['CPU_usage'].values
+    X, y = [], []
+    for i in range(len(data) - time_step):
+        X.append(data[i:i + time_step])
+        y.append(data[i + time_step])
+    return np.array(X), np.array(y)
+
+# LSTM прогноз
+def lstm_forecast(df, steps=10):
+    scaler = MinMaxScaler()
+    df['CPU_usage'] = scaler.fit_transform(df[['CPU_usage']])
+    
+    X, y = create_lstm_data(df)
+    X = X.reshape((X.shape[0], X.shape[1], 1))
+    
+    model = Sequential()
+    model.add(LSTM(50, activation='relu', input_shape=(X.shape[1], 1)))
+    model.add(Dense(1))
+    model.compile(optimizer='adam', loss='mse')
+    model.fit(X, y, epochs=200, verbose=0)
+    
+    # Прогнозирование
+    last_sequence = X[-1]
+    predictions = []
+    for _ in range(steps):
+        pred = model.predict(last_sequence.reshape(1, -1, 1))
+        predictions.append(pred[0, 0])
+        last_sequence = np.append(last_sequence[1:], pred)
+    
+    # Обратное преобразование нормализации
+    predictions = scaler.inverse_transform(np.array(predictions).reshape(-1, 1)).flatten()
+    return predictions
 
 # Визуализация данных в реальном времени
 def plot_data_realtime(df):
@@ -68,36 +107,6 @@ def plot_data_realtime(df):
 
     # Сохранение графика как изображения
     fig.savefig('server_load.png')
-
-# ARIMA моделирование
-def arima_forecast(df, steps=10):
-    model = ARIMA(df['CPU_usage'], order=(5, 1, 0))
-    model_fit = model.fit()
-    forecast = model_fit.forecast(steps=steps)
-    return forecast
-
-# LSTM моделирование
-def lstm_forecast(df, steps=10):
-    data = df['CPU_usage'].values
-    data = data.reshape((-1, 1))
-    generator = TimeseriesGenerator(data, data, length=10, batch_size=32)  # Увеличен размер батча
-    
-    model = Sequential()
-    model.add(LSTM(20, activation='relu', input_shape=(10, 1)))  # Уменьшено количество нейронов
-    model.add(Dense(1))
-    model.compile(optimizer='adam', loss='mse')
-    
-    model.fit(generator, epochs=20)  # Уменьшено количество эпох
-    
-    predictions = []
-    current_batch = data[-10:].reshape((1, 10, 1))
-    
-    for _ in range(steps):
-        pred = model.predict(current_batch)[0]
-        predictions.append(pred)
-        current_batch = np.append(current_batch[:, 1:, :], [[pred]], axis=1)
-    
-    return predictions
 
 # Оценка точности
 def evaluate_model(true_values, predictions):
@@ -179,8 +188,9 @@ async def unknown_command(message: types.Message):
     await message.reply("Извините, я не понимаю эту команду.")
 
 # Функция для определения тональности прогноза
-def determine_tone(predictions, positive_threshold=0.7, negative_threshold=0.3):
+def determine_tone(predictions, positive_threshold=0.5, negative_threshold=0.2):
     mean_prediction = np.mean(predictions)
+    
     if mean_prediction > positive_threshold:
         return "Положительный"
     elif mean_prediction < negative_threshold:
@@ -190,17 +200,14 @@ def determine_tone(predictions, positive_threshold=0.7, negative_threshold=0.3):
 
 # Функция для отображения и сохранения графика прогнозов LSTM
 def plot_and_save_lstm_forecast(predictions, filename='lstm_forecast.png'):
-    # Преобразование прогнозов в одномерный массив
-    predictions_flat = [pred[0] for pred in predictions]
-    
     plt.figure(figsize=(10, 5))
-    plt.plot(predictions_flat, marker='o', linestyle='-')
+    plt.plot(predictions, marker='o', linestyle='-')
     plt.title('LSTM Прогноз')
     plt.xlabel('Шаги')
     plt.ylabel('Прогнозируемое значение')
     plt.grid(True)
-    plt.savefig(filename)  # Сохранение графика в файл
-    plt.close()  # Закрытие графика, чтобы избежать отображения
+    plt.savefig(filename)
+    plt.close()
 
 # Основной код
 if __name__ == "__main__":
@@ -209,26 +216,24 @@ if __name__ == "__main__":
     chat_id = os.getenv('CHAT_ID')
     
     df = generate_data()
-    df_preprocessed = preprocess_data(df)
+    df, scaler = preprocess_data(df)
     
     # Визуализация данных
-    plot_data_realtime(df_preprocessed)
+    plot_data_realtime(df)
 
-    # ARIMA прогноз
-    arima_predictions = arima_forecast(df_preprocessed)
-    arima_message = f"ARIMA Прогноз на следующие шаги: {arima_predictions}\n" \
-                    f"Этот прогноз показывает ожидаемое использование CPU в ближайшие моменты времени. " \
-                    f"Тональность прогноза: {determine_tone(arima_predictions)}"
-    print(arima_message)
-    send_telegram_message(arima_message, telegram_token, chat_id)
+    # SARIMA прогноз
+    sarima_predictions = sarima_forecast(df)
+    sarima_tone = determine_tone(sarima_predictions, positive_threshold=0.3, negative_threshold=0.1)
+    print("SARIMA Прогноз:", sarima_predictions)
+    print("Тональность SARIMA прогноза:", sarima_tone)
+    send_telegram_message(f"SARIMA Прогноз на следующие шаги: {sarima_predictions}\nЭтот прогноз показывает ожидаемое использование CPU в ближайшие моменты времени. Тональность прогноза: {sarima_tone}", telegram_token, chat_id)
 
     # LSTM прогноз
-    lstm_predictions = lstm_forecast(df_preprocessed)
-    lstm_message = f"LSTM Прогноз на следующие шаги: {lstm_predictions}\n" \
-                   f"Этот прогноз основан на модели LSTM и показывает ожидаемое использование CPU. " \
-                   f"Тональность прогноза: {determine_tone(lstm_predictions)}"
-    print(lstm_message)
-    send_telegram_message(lstm_message, telegram_token, chat_id)
+    lstm_predictions = lstm_forecast(df)
+    lstm_tone = determine_tone(lstm_predictions, positive_threshold=0.3, negative_threshold=0.1)
+    print("LSTM Прогноз:", lstm_predictions)
+    print("Тональность LSTM прогноза:", lstm_tone)
+    send_telegram_message(f"LSTM Прогноз на следующие шаги: {lstm_predictions}\nЭтот прогноз основан на модели LSTM и показывает ожидаемое использование CPU. Тональность прогноза: {lstm_tone}", telegram_token, chat_id)
 
     # Отображение и сохранение графика LSTM прогноза
     plot_and_save_lstm_forecast(lstm_predictions)
@@ -237,13 +242,13 @@ if __name__ == "__main__":
     send_telegram_photo('lstm_forecast.png', telegram_token, chat_id)
 
     # Оценка точности
-    mse = evaluate_model(df_preprocessed['CPU_usage'][-10:], arima_predictions)
+    mse = evaluate_model(df['CPU_usage'][-10:], sarima_predictions)
     mse_message = f"Среднеквадратичная ошибка (MSE): {mse}"
     print(mse_message)
     send_telegram_message(mse_message, telegram_token, chat_id)
 
     # Сохранение результатов в базу данных
-    save_to_db("ARIMA", arima_predictions)
+    save_to_db("SARIMA", sarima_predictions)
     save_to_db("LSTM", lstm_predictions)
 
     # Уведомление о завершении
